@@ -1,6 +1,9 @@
+#NoTrayIcon
+
 #RequireAdmin
 #include <Array.au3>
 #include <GuiEdit.au3>
+#include <GuiTab.au3>
 #include <HotKey.au3>
 #include <HotKeyInput.au3>
 #include <Misc.au3>
@@ -16,13 +19,14 @@
 #include <StaticConstants.au3>
 #include <TabConstants.au3>
 #include <WindowsConstants.au3>
+#include <TrayConstants.au3>
 
 #pragma compile(Icon, Assets/icon.ico)
 #pragma compile(FileDescription, Diablo II Stats reader)
 #pragma compile(ProductName, D2Stats)
 #pragma compile(ProductVersion, 3.10.4)
 #pragma compile(FileVersion, 3.10.4)
-#pragma compile(Comments, 13.05.2018)
+#pragma compile(Comments, 01.06.2018)
 #pragma compile(UPX, True) ;compression
 #pragma compile(inputboxres, True)
 ;#pragma compile(ExecLevel, requireAdministrator)
@@ -49,6 +53,8 @@ endif
 Opt("MustDeclareVars", 1)
 Opt("GUICloseOnESC", 0)
 Opt("GUIOnEventMode", 1)
+Opt("TrayOnEventMode", 1)
+Opt("TrayMenuMode", 1)
 
 DefineGlobals()
 
@@ -63,7 +69,8 @@ func Main()
 
 	local $hTimerUpdateDelay = TimerInit()
 	local $bIsIngame, $bShowItems
-	
+	local $hDropFilter, $bDropFilter
+
 	while 1
 		Sleep(20)
 		
@@ -77,6 +84,7 @@ func Main()
 				if (not $bIsIngame) then
 					GUICtrlSetState($g_idNotifyTest, $GUI_ENABLE)
 					$g_bNotifyCache = True
+					$hDropFilter = GetDropFilterHandle()
 				endif
 				
 				InjectFunctions()
@@ -102,6 +110,13 @@ func Main()
 				if (_GUI_Option("nopickup") and not $bIsIngame) then _MemoryWrite($g_hD2Client + 0x11C2F0, $g_ahD2Handle, 1, "byte")
 				
 				if (_GUI_Option("notify-enabled")) then NotifierMain()
+
+				if (_GUI_Option("drop-filter") and not $hDropFilter and not $bIsIngame) then
+					if not ToggleDropFilter($hDropFilter) then
+						local $idControl = _GUI_OptionControlID("drop-filter")
+						GUICtrlSetState($idControl, $GUI_UNCHECKED)
+					endif
+				endif
 				
 				$bIsIngame = True
 			else
@@ -206,6 +221,120 @@ func GetIlvl()
 	return $iRet
 endfunc
 
+func GetItemQuality()
+	local $apOffsets[3] = [0, 0x14, 0x00]
+	return _MemoryPointerRead($g_hD2Client + 0x11BC38, $g_ahD2Handle, $apOffsets)
+endfunc
+
+func GetItemFlags()
+	local $apOffsets[3] = [0, 0x14, 0x18]
+	return _MemoryPointerRead($g_hD2Client + 0x11BC38, $g_ahD2Handle, $apOffsets)
+endfunc
+
+func GetForumColor($aLines, $iStart, $iEnd)
+	local $sColor = ""
+	local $iPos = 0
+	for $i = $iEnd to $iStart step -1
+		$iPos = StringInStr($aLines[$i], "ÿc", 1, -1)
+		if $iPos <> 0 then
+			$sColor = StringMid($aLines[$i], $iPos + 2, 1)
+			exitloop
+		endif
+	next
+	switch $sColor
+		case "1" ; red
+			return "red"
+		case "2" ; set green
+			return "#282"
+		case "3" ; blue
+			return "blue"
+		case "4" ; gold
+			return "#af7711"
+		case "5" ; grey
+			return "#8c8c8c"
+		case "8" ; orange
+			return "orange"
+		case "9" ; yellow
+			return "yellow"
+		case ":" ; green
+			return "darkgreen"
+		case ";" ; purple
+			return "#ab1994"
+		case else ; white = 0 ? ...
+			return "#fff"
+	EndSwitch
+	return $sColor
+endfunc
+
+func GetForumText($sInput, $iQuality, $iFlags, $iLvl)
+	local $asLines = StringSplit($sInput, @LF)
+	local $iLine = 1
+	local $iEnd = $asLines[0]
+	
+	if $iQuality == $eQualitySet then
+		; Skip set item list
+		while $iLine <= $iEnd
+			if $asLines[$iLine] == "" then exitloop
+			$iLine += 1
+		wend
+		$iLine += 1
+		; Skip set bonus
+		if StringLeft($asLines[$iLine], 3) == "ÿc4" then
+			$iLine += 1
+			while $iLine <= $iEnd
+				if $asLines[$iLine] == "" then exitloop
+				$iLine += 1
+			wend
+			$iLine += 1
+		endif
+	endif
+
+	local $sOutput = ""
+	for $i = ($iEnd - 1) to $iLine step -1
+		$sOutput &= $asLines[$i] & @CRLF
+	next
+
+	if $iQuality == $eQualitySet or $iQuality == $eQualityUnique or BitAND($iFlags, $ITEMFLAG_RUNEWORD) then
+		$sOutput = "[item]" & $asLines[$iEnd] & "[/item][spoil]" & @CRLF & $sOutput & "[/spoil]"
+	else
+		local $sColor = GetForumColor($asLines, $iLine, $iEnd)
+		if $iLvl == 1 and $iQuality == $eQualityNormal then
+			; This includes iLvl = 1 normal items, but w/e
+			$sOutput = "[color=" & $sColor & "][u]" & $asLines[$iEnd] & "[/u][/color]" & @CRLF
+		else
+			$sOutput = "[color=" & $sColor & "][u]" & $asLines[$iEnd] & "[/u][/color][spoil]" & @CRLF & $sOutput & "[/spoil]"
+		endif
+	endif
+	
+	$sOutput = StringRegExpReplace($sOutput, "ÿc.", "")
+
+	return $sOutput
+endfunc
+
+func GetPlainText($sInput, $iQuality, $iFlags, $iLvl)
+	local $asLines = StringSplit($sInput, @LF)
+	local $iLine = 1
+	local $iEnd = $asLines[0]
+	
+	if $iQuality == $eQualitySet then
+		; Skip set item list
+		while $iLine <= $iEnd
+			if $asLines[$iLine] == "" then exitloop
+			$iLine += 1
+		wend
+		$iLine += 1
+	endif
+	
+	local $sOutput = ""
+	for $i = $iEnd to $iLine step -1
+		$sOutput &= $asLines[$i] & @CRLF
+	next
+
+	$sOutput = StringRegExpReplace($sOutput, "ÿc.", "")
+
+	return $sOutput
+endfunc
+
 func HotKey_CopyStatsToClipboard()
 	if (not IsIngame()) then return
 	
@@ -251,7 +380,32 @@ func HotKey_CopyItemsToClipboard()
 endfunc
 
 func HotKey_CopyItem($TEST = False)
-	if ($TEST or not IsIngame() or GetIlvl() == 0) then return
+	if ($TEST or not IsIngame()) then return
+
+	local $iLvl = GetIlvl()
+	if (not $iLvl) then return
+
+	local $iQuality = GetItemQuality()
+	local $iFlags = GetItemFlags()
+	local $hTimerRetry = TimerInit()
+	local $sOutput = ""
+	
+	while ($sOutput == "" and TimerDiff($hTimerRetry) < 10)
+		$sOutput = _MemoryRead($g_hD2Win + 0xC9E58, $g_ahD2Handle, "wchar[800]")
+	wend
+	
+	if _GUI_Option("format-forum") then
+		$sOutput = GetForumText($sOutput, $iQuality, $iFlags, $iLvl)
+	else
+		$sOutput = GetPlainText($sOutput, $iQuality, $iFlags, $iLvl)
+	endif
+
+	ClipPut($sOutput)
+	PrintString("Item text copied.")
+endfunc
+
+func HotKey_CopyItemName($TEST = False)
+	if ($TEST or not IsIngame() or not GetIlvl()) then return
 
 	local $hTimerRetry = TimerInit()
 	local $sOutput = ""
@@ -260,28 +414,17 @@ func HotKey_CopyItem($TEST = False)
 		$sOutput = _MemoryRead($g_hD2Win + 0xC9E58, $g_ahD2Handle, "wchar[800]")
 	wend
 	
+	$sOutput = StringRegExpReplace($sOutput, "(?:.*\n)*(?:ÿc.)*(.+)", "$1")
 	$sOutput = StringRegExpReplace($sOutput, "ÿc.", "")
-	local $asLines = StringSplit($sOutput, @LF)
 
-	if (_GUI_Option("copy-name")) then
-		if ($g_hTimerCopyName == 0 or not (ClipGet() == $g_sCopyName)) then $g_sCopyName = ""
-		$g_hTimerCopyName = TimerInit()
-		
-		$g_sCopyName &= $asLines[$asLines[0]] & @CRLF
-		ClipPut($g_sCopyName)
-		
-		local $avItems = StringRegExp($g_sCopyName, @CRLF, $STR_REGEXPARRAYGLOBALMATCH)
-		PrintString(StringFormat("%s item name(s) copied.", UBound($avItems)))
-		return
-	endif
+	if ($g_hTimerCopyName == 0 or not (ClipGet() == $g_sCopyName)) then $g_sCopyName = ""
+	$g_hTimerCopyName = TimerInit()
 	
-	$sOutput = ""
-	for $i = $asLines[0] to 1 step -1
-		$sOutput &= $asLines[$i] & @CRLF
-	next
-
-	ClipPut($sOutput)
-	PrintString("Item text copied.")
+	$g_sCopyName &= $sOutput & @CRLF
+	ClipPut($g_sCopyName)
+	
+	local $avItems = StringRegExp($g_sCopyName, @CRLF, $STR_REGEXPARRAYGLOBALMATCH)
+	PrintString(StringFormat("Item name(s) copied: %s", UBound($avItems)))
 endfunc
 
 func HotKey_ShowIlvl($TEST = False)
@@ -296,19 +439,11 @@ func HotKey_DropFilter($TEST = False)
 
 	local $hDropFilter = GetDropFilterHandle()
 
-	if ($hDropFilter) then
-		if (EjectDropFilter($hDropFilter)) then
-			PrintString("Ejected DropFilter.", $ePrintGreen)
-			_Log("HotKey_DropFilter", "Ejected DropFilter.")
+	if ToggleDropFilter($hDropFilter) then
+		if $hDropFilter then
+			PrintString("Ejected drop filter.", $ePrintGreen)
 		else
-			_Debug("HotKey_DropFilter", "Failed to eject DropFilter.")
-		endif
-	else
-		if (InjectDropFilter()) then
-			PrintString("Injected DropFilter.", $ePrintGreen)
-			_Log("HotKey_DropFilter", "Injected DropFilter.")
-		else
-			_Debug("HotKey_DropFilter", "Failed to inject DropFilter.")
+			PrintString("Injected drop filter.", $ePrintGreen)
 		endif
 	endif
 endfunc
@@ -318,8 +453,11 @@ func HotKey_ToggleShowItems($TEST = False)
 	ToggleShowItems()
 endfunc
 
-func HotKey_ReadStats()
+func HotKey_ReadStats($TEST = False)
+	if ($TEST) then return
 	OnClick_ReadStats()
+	_GUICtrlTab_ClickTab($g_idTab, 0)
+	ShowGUI()
 endfunc
 #EndRegion
 
@@ -712,7 +850,7 @@ func NotifierCompileLine($sLine, ByRef $avRet)
 	local $iLineLength = StringLen($sLine)
 	
 	local $sArg = "", $sChar
-	local $bQuoted = False, $bHasFlags = False
+	local $bQuoted = False, $bHasFlags = False, $bMultPatWarn = False
 	
 	redim $avRet[0]
 	redim $avRet[$eNotifyFlagsLast]
@@ -722,18 +860,28 @@ func NotifierCompileLine($sLine, ByRef $avRet)
 		
 		if ($sChar == '"') then
 			if ($bQuoted) then
+				if ($avRet[$eNotifyFlagsMatch]) then $bMultPatWarn = True
 				$avRet[$eNotifyFlagsMatch] = $sArg
 				$sArg = ""
 			endif
 			
 			$bQuoted = not $bQuoted
 		elseif ($sChar == " " and not $bQuoted) then
-			if (NotifierCompileFlag($sArg, $avRet, $sLine)) then $bHasFlags = True
+			if ($sArg == "*") then
+				if ($avRet[$eNotifyFlagsMatch]) then $bMultPatWarn = True
+				$avRet[$eNotifyFlagsMatch] = "^."
+			elseif (NotifierCompileFlag($sArg, $avRet, $sLine)) then
+				$bHasFlags = True
+			endif
 			$sArg = ""
 		else
 			$sArg &= $sChar
 		endif
 	next
+
+	if ($bMultPatWarn) then
+		MsgBox($MB_ICONWARNING, "D2Stats", StringFormat("Using pattern '%s' in line:%s%s", $avRet[$eNotifyFlagsMatch], @CRLF, $sLine))
+	endif
 
 	if (NotifierCompileFlag($sArg, $avRet, $sLine)) then $bHasFlags = True
 
@@ -770,7 +918,7 @@ func NotifierCompile()
 	redim $g_avNotifyCompile[$iCount][$eNotifyFlagsLast]
 endfunc
 
-func NotifierHelp($sInput)
+func NotifierTest($sInput)
 	NotifierCache()
 	
 	local $iItems = UBound($g_avNotifyCache)
@@ -797,10 +945,14 @@ func NotifierHelp($sInput)
 				$iCount += 1
 			endif
 		next
+
+		redim $asMatches[$iCount][2]
+		if UBound($asMatches) > 0 then
+			_ArrayDisplay($asMatches, "Matched Items", default, 32, @LF, "Item|Text")
+		else
+			MsgBox($MB_ICONINFORMATION, "D2Stats", StringFormat("No items matched filter:%s%s", @CRLF, $sInput))
+		endif
 	endif
-	
-	redim $asMatches[$iCount][2]
-	_ArrayDisplay($asMatches, "Notifier Help", default, 32, @LF, "Item|Text")
 endfunc
 
 func NotifierMain()
@@ -817,9 +969,9 @@ func NotifierMain()
 	
 	local $pPath, $pUnit, $pUnitData
 	local $iUnitType, $iClass, $iQuality, $iEarLevel, $iFlags, $sName, $iTierFlag
-	local $bIsNewItem, $bIsSocketed, $bIsEthereal
+	local $bIsNewItem, $bIsSocketed, $bIsEthereal, $bIsNamed
 	local $iFlagsTier, $iFlagsQuality, $iFlagsMisc, $iFlagsColour
-	local $bNotify, $sText, $iColor
+	local $eFilter, $sText, $iColor
 	
 	local $bNotifySuperior = _GUI_Option("notify-superior")
 
@@ -849,15 +1001,16 @@ func NotifierMain()
 				if ($iEarLevel <> 0) then continueloop
 				_MemoryWrite($pUnitData + 0x48, $g_ahD2Handle, 1, "byte")
 				
-				$bIsNewItem = BitAND(0x2000, $iFlags) <> 0
-				$bIsSocketed = BitAND(0x800, $iFlags) <> 0
-				$bIsEthereal = BitAND(0x400000, $iFlags) <> 0
+				$bIsNewItem = BitAND($ITEMFLAG_NEW, $iFlags) <> 0
+				$bIsSocketed = BitAND($ITEMFLAG_SOCKETED, $iFlags) <> 0
+				$bIsEthereal = BitAND($ITEMFLAG_ETHEREAL, $iFlags) <> 0
+				$bIsNamed = BitAND($ITEMFLAG_NAMED, $iFlags) <> 0
 				
 				$sName = $g_avNotifyCache[$iClass][0]
 				$iTierFlag = $g_avNotifyCache[$iClass][1]
 				$sText = $g_avNotifyCache[$iClass][2]
 				
-				$bNotify = False
+				$eFilter = $eFilterDefault
 				
 				for $j = 0 to UBound($g_avNotifyCompile) - 1
 					if (StringRegExp($sName, $g_avNotifyCompile[$j][$eNotifyFlagsMatch])) then
@@ -875,25 +1028,39 @@ func NotifierMain()
 						elseif (BitAND($iFlagsMisc, NotifierFlag("eth"))) then
 							continueloop
 						endif
-						
-						$bNotify = True
+
+						if ($bNotifySuperior and $iQuality == $eQualitySuperior) then
+							$sText = "Superior " & $sText
+						endif
+
+						switch $iFlagsColour
+							case 0 to 12
+								$eFilter = $eFilterNotify
+							case 13
+								$eFilter = $eFilterShow
+							case 14
+								$eFilter = $eFilterHide
+						endswitch
 						exitloop
 					endif
 				next
-				
-				if ($bNotify) then
-					if ($iFlagsColour) then
+
+				if $eFilter == $eFilterNotify then
+					if ($iFlagsColour > 0) then
 						$iColor = $iFlagsColour - 1
 					elseif ($iQuality == $eQualityNormal and $iTierFlag == NotifierFlag("0")) then
 						$iColor = $ePrintOrange
 					else
 						$iColor = $g_iQualityColor[$iQuality]
 					endif
-					
-					if ($bNotifySuperior and $iQuality == $eQualitySuperior) then $sText = "Superior " & $sText
-
 					PrintString("- " & $sText, $iColor)
-					_MemoryWrite($pUnitData + 0x48, $g_ahD2Handle, 2, "byte") ; Experimental, used for Drop Filter.
+				endif
+				if not $bIsNamed then
+					if $eFilter == $eFilterHide then
+						_MemoryWrite($pUnitData + 0x48, $g_ahD2Handle, 3, "byte") ; Experimental, used for Drop Filter.
+					elseif $eFilter == $eFilterNotify or $eFilter == $eFilterShow then
+						_MemoryWrite($pUnitData + 0x48, $g_ahD2Handle, 2, "byte") ; Experimental, used for Drop Filter.
+					endif
 				endif
 			endif
 		wend
@@ -1012,6 +1179,10 @@ func _GUI_OptionByRef($iOption, byref $sOption, byref $idControl, byref $sFunc)
 	$sFunc = $g_avGUIOption[$iOption][2]
 endfunc
 
+func _GUI_OptionControlID($sOption)
+	return $g_avGUIOption[ _GUI_OptionID($sOption) + 1 ][1]
+endfunc
+
 func _GUI_OptionID($sOption)
 	for $i = 0 to UBound($g_avGUIOptionList) - 1
 		if ($g_avGUIOptionList[$i][0] == $sOption) then return $i
@@ -1038,6 +1209,29 @@ endfunc
 #EndRegion
 
 #Region GUI
+func ShowTray()
+	TraySetState(1)
+	TraySetToolTip("Show D2Stats")
+endfunc
+
+func ShowGUI()
+	if (_GUI_Option("minimize-tray")) then
+		TraySetState(2)
+		GUISetState(@SW_SHOW, $g_hGUI)
+	else
+		GUISetState(@SW_RESTORE, $g_hGUI)
+	endif
+endfunc
+
+func HideGUI()
+	if (_GUI_Option("minimize-tray")) then
+		GUISetState(@SW_HIDE, $g_hGUI)
+		ShowTray()
+	else
+		GUISetState(@SW_MINIMIZE, $g_hGUI)
+	endif
+endfunc
+
 func UpdateGUI()
 	local $sText, $iX, $idControl
 	local $asMatches, $iMatches, $iWidth, $iColor, $iStatValue
@@ -1100,12 +1294,13 @@ func OnClick_NotifyReset()
 	OnChange_NotifyEdit()
 endfunc
 
-func OnClick_NotifyTest()
+func OnClick_NotifyHelp()
 	local $asText[] = [ _ 
 		'"Item Name" flag1 flag2 ... flagN # Everything after hashtag is a comment.', _
 		'', _
 		'Item name is what you''re matching against. It''s a regex string.', _
 		'If you''re unsure what regex is, use letters only.', _
+		'Use * instead of item name pattern to match all items.', _
 		'', _
 		'Flags:', _
 		'> 0-6 sacred - Item must be one of these tiers.', _
@@ -1113,26 +1308,39 @@ func OnClick_NotifyTest()
 		'> superior rare set unique - Item must be one of these qualities.', _
 		'> eth socket - Item must be ethereal and/or socketed.', _
 		'> white red lime blue gold orange yellow green purple - Notification color', _
+		'> show hide - Show or hide items in drop filter', _
 		'', _
 		'Example:', _
 		'"Battle" sacred unique eth', _
 		'This would notify for ethereal SU Battle Axe, Battle Staff,', _
 		'Short Battle Bow and Long Battle Bow', _
 		'', _
-		'Write something in this box and click OK to see what matches!' _
+		'By default drop filter hides:', _
+		'> white/magic/rare tiered equipment with no filled sockets.', _
+		'> runes below and including Zod.', _
+		'> gems below Perfect.', _
+		'> gold stacks below 2,000.', _
+		'> magic rings, amulets and quivers.', _
+		'> various junk (mana potions, TP/ID scrolls and tomes, keys).', _
+		'> health potions below Greater.', _
+		'', _
+		'To see what items match your filter:', _
+		'> Place cursor on the line and press Test', _
+		'> Select part of a single line and press Test', _
+		'> Write something in the box below and click OK' _
 	]
 	
 	local $sText = ""
 	for $i = 0 to UBound($asText) - 1
 		$sText &= $asText[$i] & @CRLF
 	next
-	
-	local $sInput = InputBox("Notifier Test", $sText, default, default, 420, 120 + UBound($asText) * 13, default, default, default, $g_hGUI)
+
+	local $sInput = InputBox("Drop Filter/Notifier Help", $sText, default, default, 420, 120 + UBound($asText) * 13, default, default, default, $g_hGUI)
 	if (not @error) then
-		if (IsIngame()) then
-			NotifierHelp($sInput)
-		else
+		if not IsIngame() then
 			MsgBox($MB_ICONINFORMATION, "D2Stats", "You need to be ingame to do that.")
+		else
+			NotifierTest($sInput)
 		endif
 	endif
 endfunc
@@ -1140,6 +1348,26 @@ endfunc
 func OnClick_NotifyDefault()
 	GUICtrlSetData($g_idNotifyEdit, $g_sNotifyTextDefault)
 	OnChange_NotifyEdit()
+endfunc
+
+func OnClick_NotifyTest()
+	local $aSel = _GUICtrlEdit_GetSel($g_idNotifyEdit)
+	local $sInput = ""
+	if $aSel[0] == $aSel[1] then
+		; Test current line
+		$sInput = _GUICtrlEdit_GetLine($g_idNotifyEdit, _GUICtrlEdit_LineFromChar($g_idNotifyEdit, $aSel[0]))
+	else
+		; Test selection
+		$sInput = StringMid(_GUICtrlEdit_GetText($g_idNotifyEdit), $aSel[0] + 1, $aSel[1] - $aSel[0])
+	endif
+
+	if StringInStr($sInput, @LF) or StringRegExp($sInput, "^\s*(?:#.*)?$") then
+		MsgBox($MB_ICONINFORMATION, "D2Stats", "Select a part of the line or place cursor on the line you want to test.")
+	elseif not IsIngame() then
+		MsgBox($MB_ICONINFORMATION, "D2Stats", "You need to be ingame to do that.")
+	else
+		NotifierTest($sInput)
+	endif
 endfunc
 
 func OnChange_NotifyEdit()
@@ -1159,7 +1387,7 @@ func CreateGUI()
 	global $g_iGUIWidth = 16 + 4*$g_iGroupWidth
 	global $g_iGUIHeight = 34 + 15*$g_iGroupLines
 
-	local $sTitle = not @Compiled ? "Test" : StringFormat("D2Stats %s - [%s]", FileGetVersion(@AutoItExe, "FileVersion"), FileGetVersion(@AutoItExe, "Comments"))
+	local $sTitle = not @Compiled ? "D2Stats [Test]" : StringFormat("D2Stats %s - [%s]", FileGetVersion(@AutoItExe, "FileVersion"), FileGetVersion(@AutoItExe, "Comments"))
 	
 	global $g_hGUI = GUICreate($sTitle, $g_iGUIWidth, $g_iGUIHeight)
 	GUISetFont(9 / _GetDPI()[2], 0, 0, "Courier New")
@@ -1178,7 +1406,10 @@ func CreateGUI()
 
 	local $avAccelKeys[][2] = [ ["^a", $idDummySelectAll] ]
 	GUISetAccelerators($avAccelKeys)
-	
+
+	GUISetOnEvent($GUI_EVENT_MINIMIZE, "HideGUI")
+	TraySetOnEvent($TRAY_EVENT_PRIMARYUP, "ShowGUI")
+
 #Region Stats
 	GUICtrlCreateTabItem("Page 1")
 	_GUI_GroupFirst()
@@ -1285,10 +1516,16 @@ func CreateGUI()
 	LoadGUISettings()
 	_GUI_GroupX(8)
 	
-	GUICtrlCreateTabItem("Options")
+	GUICtrlCreateTabItem("Options 1")
 	local $iOption = 0
 	
 	for $j = 1 to $g_iGUIOptionsGeneral
+		_GUI_NewOption($j-1, $g_avGUIOptionList[$iOption][0], $g_avGUIOptionList[$iOption][3], $g_avGUIOptionList[$iOption][4])
+		$iOption += 1
+	next
+
+	GUICtrlCreateTabItem("Options 2")
+	for $j = 1 to $g_iGUIOptionsNotifier
 		_GUI_NewOption($j-1, $g_avGUIOptionList[$iOption][0], $g_avGUIOptionList[$iOption][3], $g_avGUIOptionList[$iOption][4])
 		$iOption += 1
 	next
@@ -1299,7 +1536,7 @@ func CreateGUI()
 		$iOption += 1
 	next
 	
-	GUICtrlCreateTabItem("Notifier")
+	GUICtrlCreateTabItem("Filter")
 	
 	local $iNotifyY = $g_iGUIHeight - 29
 	
@@ -1309,23 +1546,15 @@ func CreateGUI()
 	GUICtrlSetOnEvent(-1, "OnClick_NotifySave")
 	global $g_idNotifyReset = GUICtrlCreateButton("Reset", 4 + 1*62, $iNotifyY, 60, 25)
 	GUICtrlSetOnEvent(-1, "OnClick_NotifyReset")
-	global $g_idNotifyTest = GUICtrlCreateButton("Help", 4 + 2*62, $iNotifyY, 60, 25)
-	GUICtrlSetOnEvent(-1, "OnClick_NotifyTest")
+	GUICtrlCreateButton("Help", 4 + 2*62, $iNotifyY, 60, 25)
+	GUICtrlSetOnEvent(-1, "OnClick_NotifyHelp")
 	GUICtrlCreateButton("Default", 4 + 3*62, $iNotifyY, 60, 25)
 	GUICtrlSetOnEvent(-1, "OnClick_NotifyDefault")
+	global $g_idNotifyTest = GUICtrlCreateButton("Test", $g_iGUIWidth - 64, $iNotifyY, 60, 25)
+	GUICtrlSetState(-1, $GUI_DISABLE)
+	GUICtrlSetOnEvent(-1, "OnClick_NotifyTest")
 	
 	OnClick_NotifyReset()
-
-	GUICtrlCreateTabItem("Drop filter")
-	_GUI_GroupX(8)
-	_GUI_NewTextBasic(00, "The drop filter for 3.9.8 hides:", False)
-	_GUI_NewTextBasic(01, " White/magic/rare tiered equipment with no filled sockets.", False)
-	_GUI_NewTextBasic(02, " Runes below and including Zod.", False)
-	_GUI_NewTextBasic(03, " Gems below Perfect.", False)
-	_GUI_NewTextBasic(04, " Gold stacks below 2,000.", False)
-	_GUI_NewTextBasic(05, " Magic rings, amulets and quivers.", False)
-	_GUI_NewTextBasic(06, " Various junk (mana potions, TP/ID scrolls and tomes, keys).", False)
-	_GUI_NewTextBasic(07, " Health potions below Greater.", False)
 	
 	GUICtrlCreateTabItem("About")
 	_GUI_GroupX(8)
@@ -1344,8 +1573,16 @@ func CreateGUI()
 	GUICtrlCreateTabItem("")
 	UpdateGUI()
 	GUIRegisterMsg($WM_COMMAND, "WM_COMMAND")
-	
-	GUISetState(@SW_SHOW)
+
+	if (_GUI_Option("start-minimized")) then
+		if (_GUI_Option("minimize-tray")) then
+			ShowTray()
+		else
+			GUISetState(@SW_SHOWMINIMIZED, $g_hGUI)
+		endif
+	else
+		GUISetState(@SW_SHOW, $g_hGUI)
+	endif
 endfunc
 
 func UpdateGUIOptions()
@@ -1537,6 +1774,27 @@ D2Client.dll+59081 - 0F85
 -->
 D2Client.dll+5907E - E9 *           - jmp DropFilter.dll+15D0 { PATCH_DropFilter }
 #ce
+
+func ToggleDropFilter($hDropFilter)
+	if ($hDropFilter) then
+		if (EjectDropFilter($hDropFilter)) then
+			; PrintString("Ejected DropFilter.", $ePrintGreen)
+			_Log("ToggleDropFilter", "Ejected DropFilter.")
+			return True
+		else
+			_Debug("ToggleDropFilter", "Failed to eject DropFilter.")
+		endif
+	else
+		if (InjectDropFilter()) then
+			; PrintString("Injected DropFilter.", $ePrintGreen)
+			_Log("ToggleDropFilter", "Injected DropFilter.")
+			return True
+		else
+			_Debug("ToggleDropFilter", "Failed to inject DropFilter.")
+		endif
+	endif
+	return False
+endfunc
 
 func InjectDropFilter()
 	local $sPath = FileGetLongName("DropFilter.dll", $FN_RELATIVEPATH)
@@ -1743,6 +2001,15 @@ func DefineGlobals()
 	
 	global const $HK_FLAG_D2STATS = BitOR($HK_FLAG_DEFAULT, $HK_FLAG_NOUNHOOK)
 
+	global const $ITEMFLAG_IDENTIFIED = 0x00000010
+    global const $ITEMFLAG_SOCKETED = 0x00000800
+	global const $ITEMFLAG_NEW = 0x00002000
+    global const $ITEMFLAG_NAMED = 0x00008000
+    global const $ITEMFLAG_INEXPENSIVE = 0x00020000
+    global const $ITEMFLAG_COMPACTSAVE = 0x00200000
+    global const $ITEMFLAG_ETHEREAL = 0x00400000
+    global const $ITEMFLAG_RUNEWORD = 0x04000000
+
 	global const $g_iColorRed	= 0xFF0000
 	global const $g_iColorBlue	= 0x0066CC
 	global const $g_iColorGold	= 0x808000
@@ -1751,6 +2018,7 @@ func DefineGlobals()
 	
 	global enum $ePrintWhite, $ePrintRed, $ePrintLime, $ePrintBlue, $ePrintGold, $ePrintGrey, $ePrintBlack, $ePrintUnk, $ePrintOrange, $ePrintYellow, $ePrintGreen, $ePrintPurple
 	global enum $eQualityNone, $eQualityLow, $eQualityNormal, $eQualitySuperior, $eQualityMagic, $eQualitySet, $eQualityRare, $eQualityUnique, $eQualityCraft, $eQualityHonorific
+	global enum $eFilterDefault, $eFilterNotify, $eFilterShow, $eFilterHide
 	global $g_iQualityColor[] = [0x0, $ePrintWhite, $ePrintWhite, $ePrintWhite, $ePrintBlue, $ePrintLime, $ePrintYellow, $ePrintGold, $ePrintOrange, $ePrintGreen]
 	
 	global $g_avGUI[256][3] = [[0]]			; Text, X, Control [0] Count
@@ -1761,7 +2029,7 @@ func DefineGlobals()
 		[ "0", "1", "2", "3", "4", "5", "6", "sacred" ], _
 		[ "low", "normal", "superior", "magic", "set", "rare", "unique", "craft", "honor" ], _
 		[ "eth", "socket" ], _
-		[ "clr_none", "white", "red", "lime", "blue", "gold", "grey", "black", "clr_unk", "orange", "yellow", "green", "purple" ] _
+		[ "clr_none", "white", "red", "lime", "blue", "gold", "grey", "black", "clr_unk", "orange", "yellow", "green", "purple", "show", "hide" ] _
 	]
 
 	global $g_avNotifyCache[0][3]					; Name, Tier flag, Last line of name
@@ -1784,7 +2052,8 @@ func DefineGlobals()
 	global $g_hTimerCopyName = 0
 	global $g_sCopyName = ""
 
-	global const $g_iGUIOptionsGeneral = 6
+	global const $g_iGUIOptionsGeneral = 5
+	global const $g_iGUIOptionsNotifier = 5
 	global const $g_iGUIOptionsHotkey = 7
 
 	global const $g_sNotifyTextDefault = BinaryToString("0x312032203320342035203620756E6971756520202020202020202020232054696572656420756E69717565730D0A73616372656420756E69717565202020202020202020202020202020232053616372656420756E69717565730D0A2252696E67247C416D756C65747C4A6577656C2220756E69717565202320556E69717565206A6577656C72790D0A225175697665722220756E697175650D0A7365740D0A2242656C6C61646F6E6E61220D0A22536872696E65205C283130222020202020202020202020202020202320536872696E65730D0A23225175697665722220726172650D0A232252696E67247C416D756C65742220726172652020202020202020202320526172652072696E677320616E6420616D756C6574730D0A2373616372656420657468207375706572696F7220726172650D0A0D0A225369676E6574206F662028536B696C6C7C4C6561726E696E6729220D0A2247726561746572205369676E6574220D0A22456D626C656D220D0A2254726F706879220D0A224379636C65220D0A22456E6368616E74696E67220D0A2257696E6773220D0A2252756E6573746F6E657C457373656E63652422202320546567616E7A652072756E65730D0A2247726561742052756E6522202020202020202020232047726561742072756E65730D0A224F72625C7C2220202020202020202020202020202320554D4F730D0A222844656D6F6E7C45647972656D29204B6579220D0A224F696C206F6620436F6E6A75726174696F6E220D0A224C7563696F6E7C466F6F6C7C4D79737469632053686172647C476F64737C476C6F72696F75737C20456172220D0A232252696E67206F6620746865204669766522")
@@ -1792,13 +2061,17 @@ func DefineGlobals()
 		["nopickup", 0, "cb", "Automatically enable /nopickup"], _
 		["hidePass", 0, "cb", "Hide game password when minimap is open"], _
 		["mousefix", 0, "cb", "Continue attacking when monster dies under cursor"], _
+		["start-minimized", 0, "cb", "Start minimized"], _
+		["minimize-tray", 0, "cb", "Minimize to tray"], _
 		["notify-enabled", 1, "cb", "Enable notifier"], _
 		["notify-superior", 0, "cb", "Notifier prefixes superior items with 'Superior'"], _
-		["notify-filter", 0, "cb", "Drop Filter only shows items that are notified"], _
-		["copy", 0x002D, "hk", "Copy item text", "HotKey_CopyItem"], _
-		["copy-name", 0, "cb", "Only copy item name"], _
+		["drop-filter", 0, "cb", "Auto-inject drop filter"], _
+		["notify-filter", 0, "cb", "Use custom drop filter"], _
+		["filter", 0x0124, "hk", "Toggle drop filter", "HotKey_DropFilter"], _
+		["copy", 0x012D, "hk", "Copy item text", "HotKey_CopyItem"], _
+		["format-forum", 0, "cb", "Format item text for forums"], _
+		["copy-name", 0x002D, "hk", "Copy item name", "HotKey_CopyItemName"], _
 		["ilvl", 0x002E, "hk", "Display item ilvl", "HotKey_ShowIlvl"], _
-		["filter", 0x0124, "hk", "Inject/eject DropFilter", "HotKey_DropFilter"], _
 		["toggle", 0x0024, "hk", "Switch Show Items between hold/toggle mode", "HotKey_ToggleShowItems"], _
 		["toggleMsg", 1, "cb", "Message when Show Items is disabled in toggle mode"], _
 		["readstats", 0x0000, "hk", "Read stats without tabbing out of the game", "HotKey_ReadStats"], _
